@@ -42,6 +42,7 @@
 //
 // This #include imports the sample_hardware abstraction from that hardware definition.
 #include <hw/sample_hardware.h>
+#include <pthread.h>
 
 #include "epoll_timerfd_utilities.h"
 
@@ -64,7 +65,8 @@ static char scopeId[SCOPEID_LENGTH]; // ScopeId for the Azure IoT Central applic
 
 static IOTHUB_DEVICE_CLIENT_LL_HANDLE iothubClientHandle = NULL;
 static const int keepalivePeriodSeconds = 20;
-static bool iothubAuthenticated = false;
+static bool iothubConnected = false;
+static pthread_t iothub_thread_id = NULL;
 static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void *context);
 static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char *payload,
                          size_t payloadSize, void *userContextCallback);
@@ -114,6 +116,21 @@ static void SendMessageButtonHandler(void);
 static void SendOrientationButtonHandler(void);
 static bool deviceIsUp = false; // Orientation
 static void AzureTimerEventHandler(EventData *eventData);
+
+
+/// <summary>
+///     Dedicated thread for DoWork
+/// </summary>
+static void* iothub_thread(void* ptr)
+{
+    struct timespec ts = { 0, 10000000 };
+
+    while (1) {
+        // 100ms loop
+        IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
+        nanosleep(&ts, &ts);
+    }
+}
 
 /// <summary>
 ///     Signal handler for termination requests. This handler must be async-signal-safe.
@@ -182,16 +199,15 @@ static void AzureTimerEventHandler(EventData *eventData)
 
     bool isNetworkReady = false;
     if (Networking_IsNetworkingReady(&isNetworkReady) != -1) {
-        if (isNetworkReady && !iothubAuthenticated) {
+        if (isNetworkReady && !iothubConnected) {
             SetupAzureClient();
         }
     } else {
         Log_Debug("Failed to get Network state\n");
     }
-
-    if (iothubAuthenticated) {
+    
+    if (iothubConnected) {
         SendSimulatedTemperature();
-        IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
     }
 }
 
@@ -256,6 +272,8 @@ static int InitPeripheralsAndHandlers(void)
         return -1;
     }
 
+    pthread_create(&iothub_thread_id, NULL, iothub_thread, NULL);
+
     return 0;
 }
 
@@ -277,6 +295,8 @@ static void ClosePeripheralsAndHandlers(void)
     CloseFdAndPrintError(sendOrientationButtonGpioFd, "SendOrientationButton");
     CloseFdAndPrintError(deviceTwinStatusLedGpioFd, "StatusLed");
     CloseFdAndPrintError(epollFd, "Epoll");
+
+    pthread_cancel(iothub_thread_id);
 }
 
 /// <summary>
@@ -287,8 +307,8 @@ static void HubConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result,
                                         IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason,
                                         void *userContextCallback)
 {
-    iothubAuthenticated = (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED);
-    Log_Debug("IoT Hub Authenticated: %s\n", GetReasonString(reason));
+    iothubConnected = (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED);
+    Log_Debug("IoT Hub Connection Status: %s\n", GetReasonString(reason));
 }
 
 /// <summary>
@@ -298,8 +318,10 @@ static void HubConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result,
 /// </summary>
 static void SetupAzureClient(void)
 {
-    if (iothubClientHandle != NULL)
+    if (iothubClientHandle != NULL) {
         IoTHubDeviceClient_LL_Destroy(iothubClientHandle);
+        iothubClientHandle = NULL;
+    }
 
     AZURE_SPHERE_PROV_RETURN_VALUE provResult =
         IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning(scopeId, 10000,
@@ -333,8 +355,6 @@ static void SetupAzureClient(void)
     azureIoTPollPeriodSeconds = AzureIoTDefaultPollPeriodSeconds;
     struct timespec azureTelemetryPeriod = {azureIoTPollPeriodSeconds, 0};
     SetTimerFdToPeriod(azureTimerFd, &azureTelemetryPeriod);
-
-    iothubAuthenticated = true;
 
     if (IoTHubDeviceClient_LL_SetOption(iothubClientHandle, OPTION_KEEP_ALIVE,
                                         &keepalivePeriodSeconds) != IOTHUB_CLIENT_OK) {
