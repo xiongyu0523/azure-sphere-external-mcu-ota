@@ -42,7 +42,6 @@
 //
 // This #include imports the sample_hardware abstraction from that hardware definition.
 #include <hw/sample_hardware.h>
-#include <pthread.h>
 
 #include "epoll_timerfd_utilities.h"
 
@@ -66,7 +65,6 @@ static char scopeId[SCOPEID_LENGTH]; // ScopeId for the Azure IoT Central applic
 static IOTHUB_DEVICE_CLIENT_LL_HANDLE iothubClientHandle = NULL;
 static const int keepalivePeriodSeconds = 20;
 static bool iothubConnected = false;
-static pthread_t iothub_thread_id = NULL;
 static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void *context);
 static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char *payload,
                          size_t payloadSize, void *userContextCallback);
@@ -97,6 +95,7 @@ static bool statusLedOn = false;
 // Timer / polling
 static int buttonPollTimerFd = -1;
 static int azureTimerFd = -1;
+static int azureDoWorkFd = -1;
 static int epollFd = -1;
 
 // Azure IoT poll periods
@@ -116,21 +115,7 @@ static void SendMessageButtonHandler(void);
 static void SendOrientationButtonHandler(void);
 static bool deviceIsUp = false; // Orientation
 static void AzureTimerEventHandler(EventData *eventData);
-
-
-/// <summary>
-///     Dedicated thread for DoWork
-/// </summary>
-static void* iothub_thread(void* ptr)
-{
-    struct timespec ts = { 0, 10000000 };
-
-    while (1) {
-        // 100ms loop
-        IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
-        nanosleep(&ts, &ts);
-    }
-}
+static void AzureDoWorkEventHandler(EventData* eventData);
 
 /// <summary>
 ///     Signal handler for termination requests. This handler must be async-signal-safe.
@@ -211,9 +196,23 @@ static void AzureTimerEventHandler(EventData *eventData)
     }
 }
 
+/// <summary>
+/// 100ms event to call DoWork
+/// </summary>
+static void AzureDoWorkEventHandler(EventData* eventData)
+{
+    if (ConsumeTimerFdEvent(azureDoWorkFd) != 0) {
+        terminationRequired = true;
+        return;
+    }
+
+    IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
+}
+
 // event handler data structures. Only the event handler field needs to be populated.
 static EventData buttonPollEventData = {.eventHandler = &ButtonPollTimerEventHandler};
 static EventData azureEventData = {.eventHandler = &AzureTimerEventHandler};
+static EventData azureDoWorkData = { .eventHandler = &AzureDoWorkEventHandler };
 
 /// <summary>
 ///     Set up SIGTERM termination handler, initialize peripherals, and set up event handlers.
@@ -272,7 +271,12 @@ static int InitPeripheralsAndHandlers(void)
         return -1;
     }
 
-    pthread_create(&iothub_thread_id, NULL, iothub_thread, NULL);
+    struct timespec period = { 0, 10000000 };
+    azureDoWorkFd =
+        CreateTimerFdAndAddToEpoll(epollFd, &period, &azureDoWorkData, EPOLLIN);
+    if (azureDoWorkFd < 0) {
+        return -1;
+    }
 
     return 0;
 }
@@ -291,12 +295,11 @@ static void ClosePeripheralsAndHandlers(void)
 
     CloseFdAndPrintError(buttonPollTimerFd, "ButtonTimer");
     CloseFdAndPrintError(azureTimerFd, "AzureTimer");
+    CloseFdAndPrintError(azureDoWorkFd, "AzureDoWork");
     CloseFdAndPrintError(sendMessageButtonGpioFd, "SendMessageButton");
     CloseFdAndPrintError(sendOrientationButtonGpioFd, "SendOrientationButton");
     CloseFdAndPrintError(deviceTwinStatusLedGpioFd, "StatusLed");
     CloseFdAndPrintError(epollFd, "Epoll");
-
-    pthread_cancel(iothub_thread_id);
 }
 
 /// <summary>
