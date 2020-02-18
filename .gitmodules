@@ -1,0 +1,6 @@
+[submodule "sha256"]
+	path = sha256
+	url = https://github.com/ilvn/SHA256
+[submodule "littlefs"]
+	path = littlefs
+	url = https://github.com/ARMmbed/littlefs

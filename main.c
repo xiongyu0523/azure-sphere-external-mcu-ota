@@ -53,6 +53,8 @@
 #include <iothub.h>
 #include <azure_sphere_provisioning.h>
 
+#include "ota/ota.h"
+
 static volatile sig_atomic_t terminationRequired = false;
 
 #include "parson.h" // used to parse Device Twin messages.
@@ -108,6 +110,9 @@ static int azureIoTPollPeriodSeconds = -1;
 // Button state variables
 static GPIO_Value_Type sendMessageButtonState = GPIO_Value_High;
 static GPIO_Value_Type sendOrientationButtonState = GPIO_Value_High;
+
+// Firmware Version
+static const char* extFirmwareVersion = "1.0.0";
 
 static void ButtonPollTimerEventHandler(EventData *eventData);
 static bool IsButtonPressed(int fd, GPIO_Value_Type *oldState);
@@ -172,6 +177,35 @@ static void ButtonPollTimerEventHandler(EventData *eventData)
     SendOrientationButtonHandler();
 }
 
+static void __report_ota_state_dev_twin(enum ota_status_t status, enum ota_error_t error)
+{
+    const char *cOtaStatusString[] = {
+        "downloading",
+        "interrupted",
+        "applying",
+        "applied",
+        "error",
+        "invalid"
+    };
+
+    const char *cOtaErrorString[] = {
+        "SHA256 verify fail",
+        "Http Response > 400",
+        "Network Timeout",
+        "MCU Download fail",
+        "None"
+    };
+
+    static char buffer[100] = { 0 };
+    (void)snprintf(buffer, 100, "{\"extFwInfo\":{\"Status\":\"%s\",\"Error\":\"%s\"}}", cOtaStatusString[status], cOtaErrorString[error]);
+
+    Log_Debug("str=%s\n", buffer);
+
+    if (IoTHubDeviceClient_LL_SendReportedState(iothubClientHandle, buffer, strlen(buffer), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
+        Log_Debug("ERROR: IoTHubDeviceClient_LL_SendReportedState call fail\n");
+    }
+}
+
 /// <summary>
 /// Azure timer event:  Check connection status and send telemetry
 /// </summary>
@@ -201,9 +235,25 @@ static void AzureTimerEventHandler(EventData *eventData)
 /// </summary>
 static void AzureDoWorkEventHandler(EventData* eventData)
 {
+    static enum ota_status_t s_lastOtaState = otaStatusInvalid;
+    enum ota_status_t ota_status;
+    enum ota_error_t ota_error;
+
     if (ConsumeTimerFdEvent(azureDoWorkFd) != 0) {
         terminationRequired = true;
         return;
+    }
+
+    // async report state to Azure IoT
+    OtaGetState(&ota_status, &ota_error);
+    if (ota_status != s_lastOtaState) {
+        s_lastOtaState = ota_status;
+
+        __report_ota_state_dev_twin(ota_status, ota_error);
+
+        if ((ota_status == otaInterrupted) && (ota_error == otaErrTimeout)) {
+            iothubConnected = false;
+        }
     }
 
     IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
@@ -271,12 +321,14 @@ static int InitPeripheralsAndHandlers(void)
         return -1;
     }
 
-    struct timespec period = { 0, 10000000 };
-    azureDoWorkFd =
-        CreateTimerFdAndAddToEpoll(epollFd, &period, &azureDoWorkData, EPOLLIN);
+    // create a timer in this thread 
+    struct timespec period = { 0, 100000000 };
+    azureDoWorkFd = CreateTimerFdAndAddToEpoll(epollFd, &period, &azureDoWorkData, EPOLLIN);
     if (azureDoWorkFd < 0) {
         return -1;
     }
+
+    OtaInit();
 
     return 0;
 }
@@ -365,6 +417,8 @@ static void SetupAzureClient(void)
         return;
     }
 
+    //IoTHubDeviceClient_LL_SetRetryPolicy(iothubClientHandle, IOTHUB_CLIENT_RETRY_NONE, 0);
+
     IoTHubDeviceClient_LL_SetDeviceTwinCallback(iothubClientHandle, TwinCallback, NULL);
     IoTHubDeviceClient_LL_SetConnectionStatusCallback(iothubClientHandle,
                                                       HubConnectionStatusCallback, NULL);
@@ -404,13 +458,9 @@ static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned ch
         desiredProperties = rootObject;
     }
 
-    // Handle the Device Twin Desired Properties here.
-    JSON_Object *LEDState = json_object_dotget_object(desiredProperties, "StatusLED");
-    if (LEDState != NULL) {
-        statusLedOn = (bool)json_object_get_boolean(LEDState, "value");
-        GPIO_SetValue(deviceTwinStatusLedGpioFd,
-                      (statusLedOn == true ? GPIO_Value_Low : GPIO_Value_High));
-        TwinReportBoolState("StatusLED", statusLedOn);
+    JSON_Object* extFwInfoProperties = json_object_dotget_object(desiredProperties, "extFwInfo");
+    if (extFwInfoProperties != NULL) {
+        OtaHandler(extFwInfoProperties);
     }
 
 cleanup:
