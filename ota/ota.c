@@ -14,6 +14,8 @@
 #include <applibs/storage.h>
 
 #include "../sha256/mark2/sha256.h"
+#include "../littlefs_w25q128.h"
+#include "../littlefs/lfs.h"
 
 #include <curl/curl.h>
 #include <curl/easy.h>
@@ -23,8 +25,12 @@
 
 #define MAX_REQUEST 3
 
+static void OtaSetState(enum ota_status_t status, enum ota_error_t error);
+static void OtaSetVersion(uint32_t version);
+
 struct ota_request_t {
     uint32_t version;
+    uint32_t size;
     char *p_url;
     char *p_sas;
     char *p_sha256;
@@ -47,9 +53,11 @@ struct ota_state_t {
 struct ota_context_t {
     bool is_inited;
     struct ota_state_t ota_state;
+    uint32_t ota_version;
     int local_record_fd;
     pthread_t ota_thread;
     struct ota_queue_t ota_queue;
+    lfs_t lfs
 };
 
 static struct ota_context_t* pOtaContext = NULL;
@@ -57,30 +65,22 @@ static struct ota_context_t* pOtaContext = NULL;
 uint8_t dummy[1024 * 100];
 uint32_t position = 0;
 
-void __OtaEventDequeue(uint32_t* ver, char** url, char **sas, char** sha256)
+void __OtaEventDequeue(struct ota_request_t* req)
 {
     (void)sem_wait(&pOtaContext->ota_queue.semaphr);
 
     (void)pthread_mutex_lock(&pOtaContext->ota_queue.lock);
-    *ver = pOtaContext->ota_queue.requests[pOtaContext->ota_queue.rpos].version;
-    *url = pOtaContext->ota_queue.requests[pOtaContext->ota_queue.rpos].p_url;
-    *sas = pOtaContext->ota_queue.requests[pOtaContext->ota_queue.rpos].p_sas;
-    *sha256 = pOtaContext->ota_queue.requests[pOtaContext->ota_queue.rpos].p_sha256;
-    pOtaContext->ota_queue.rpos++;
+    *req = pOtaContext->ota_queue.requests[pOtaContext->ota_queue.rpos++];
     if (pOtaContext->ota_queue.rpos >= MAX_REQUEST) {
         pOtaContext->ota_queue.rpos = 0;
     }
     (void)pthread_mutex_unlock(&pOtaContext->ota_queue.lock);
 }
 
-void __OtaEventEnqueue(uint32_t ver, char* url, char *sas, char* sha256)
+void __OtaEventEnqueue(struct ota_request_t *req)
 {
     (void)pthread_mutex_lock(&pOtaContext->ota_queue.lock);
-    pOtaContext->ota_queue.requests[pOtaContext->ota_queue.wpos].version = ver;
-    pOtaContext->ota_queue.requests[pOtaContext->ota_queue.wpos].p_url = url;
-    pOtaContext->ota_queue.requests[pOtaContext->ota_queue.wpos].p_sas = sas;
-    pOtaContext->ota_queue.requests[pOtaContext->ota_queue.wpos].p_sha256 = sha256;
-    pOtaContext->ota_queue.wpos++;
+    pOtaContext->ota_queue.requests[pOtaContext->ota_queue.wpos++] = *req;
     if (pOtaContext->ota_queue.wpos >= MAX_REQUEST) {
         pOtaContext->ota_queue.wpos = 0;
     }
@@ -159,6 +159,47 @@ cleanup:
     return version;
 }
 
+static bool __image_verify(lfs_file_t *p_file, const char *p_target_sha256_str)
+{
+    uint8_t hashValue[SHA256_BYTES];
+    sha256_context ctx;
+    char hashString[SHA256_BYTES * 2 + sizeof('\0')];
+    char buffer[512];
+    lfs_ssize_t nb;
+
+    // to make it be a string
+    hashString[SHA256_BYTES * 2] = '\0';
+
+    lfs_file_seek(&pOtaContext->lfs, p_file, 0, LFS_SEEK_SET);
+    sha256_init(&ctx);
+
+    do {
+        nb = lfs_file_read(&pOtaContext->lfs, p_file, buffer, 512);
+        if (nb > 0) {
+            sha256_hash(&ctx, &buffer[0], nb);
+        } else if (nb == 0) {
+            break;
+        } else {
+            Log_Debug("ERROR: IO Error during image verify\n");
+            return false;
+        }
+    } while (true);
+
+    sha256_done(&ctx, &hashValue[0]);
+
+    for (uint32_t i = 0; i < SHA256_BYTES; i++) {
+        sprintf(&hashString[i * 2], "%02X", hashValue[i]);
+    }
+
+    if (strcmp(hashString, p_target_sha256_str) == 0) {
+        Log_Debug("INFO: Image verification pass!\n");
+        return true;
+    } else {
+        Log_Debug("WARNING: Image verification fail, calculated sha256 = %s\n", hashString);
+        return false;
+    }
+}
+
 static void LogCurlError(const char* message, int curlErrCode)
 {
     Log_Debug(message);
@@ -167,69 +208,99 @@ static void LogCurlError(const char* message, int curlErrCode)
 
 static size_t write_callback(void* ptr, size_t size, size_t nmemb, void* userdata)
 {
-    // size is always 1, nmemb can varies, return a value != nmemb will terminate the transfer
+    lfs_file_t* p_file = userdata;
 
-    if (position == 0) {
-        sha256_init((sha256_context*)userdata);
+    if (lfs_file_write(&pOtaContext->lfs, p_file, ptr, nmemb) != nmemb) {
+        Log_Debug("ERROR: less number of bytes write to file\n");
+        return 0;
+    } else {
+        return nmemb;
     }
-
-    //memcpy(&dummy[position], ptr, nmemb);
-
-    sha256_hash((sha256_context*)userdata, ptr, nmemb);
-
-    position += nmemb;
-
-    return nmemb;
 }
 
 static int dl_progress(void* clientp, double dltotal, double dlnow, double ultotal, double ulnow)
 {
-    if (dlnow && dltotal) {
-        Log_Debug("dl:%3.0f%%\r", 100 * dlnow / dltotal);
-    }
+    Log_Debug("%d in %d bytes transfered\n", (int)dlnow, (int)dltotal);
     return 0;
 }
-
 
 static void* ota_thread(void* arg) 
 {
     uint32_t local_version;
-    uint32_t server_version;
-    char    *image_url;
-    char    *image_sha256;
-    char    *sas_token;
+    struct ota_request_t req;
 
     uint32_t resume_offset;
     bool need_download;
     bool has_partial_image;
+    bool finish_download;
+    lfs_file_t ota_binary_file;
 
     while (1) {
 
-        __OtaEventDequeue(&server_version, &image_url, &sas_token, &image_sha256);
+        __OtaEventDequeue(&req);
+        Log_Debug("Checking OTA, server version is %d\n", req.version);
+        Log_Debug("URL = %s\n", req.p_url);
+        Log_Debug("SAS = %s\n", req.p_sas);
+        Log_Debug("SHA256 = %s\n", req.p_sha256);
 
-        Log_Debug("Remote version = %d\n", server_version);
+        if (lfs_file_open(&pOtaContext->lfs, &ota_binary_file, "ota.bin", LFS_O_RDWR | LFS_O_CREAT) != LFS_ERR_OK) {
+            Log_Debug("ERROR: Unable to open ota.bin file\n");
+            OtaSetState(otaError, otaErrIo);
+            free(req.p_url);
+            free(req.p_sas);
+            free(req.p_sha256);
+            continue;
+        }
 
         resume_offset = 0;
         need_download = true;
         has_partial_image = false;
+        finish_download = false;
 
         local_version = __get_local_record(&has_partial_image);
+        
+        // if the record file is {"Downloading":x}, it means there is a partial received image on file system
         if (has_partial_image) {
-            if (local_version > server_version) {
+
+            // when x is newer version than server push, we do not roll back. or we can accept roll back depends real policy.
+            if (local_version > req.version) {
                 need_download = false;
-            } else if (local_version == server_version) {
-                resume_offset = position;
-                Log_Debug("Resuming download from %d\n", resume_offset);
+            // when x is euqal to server version, we will try to resume from the last break point.
+            } else if (local_version == req.version) {
+                lfs_soff_t size = lfs_file_seek(&pOtaContext->lfs, &ota_binary_file, 0, LFS_SEEK_END);
+                if (size >= 0) {
+                    if (size < req.size) {
+                        resume_offset = size;
+                    } else if (size == req.size) {
+                        need_download = false;
+                        finish_download = true;
+                    } else {
+                        need_download = false;
+                        Log_Debug("ERROR: Incorrect file size\n");
+                    }
+                } else {
+                    resume_offset = 0;
+                }
             }
         } else {
-            if (local_version >= server_version) {
+            // if the record file is {"Completed":x}, it means there is a previous completed image on file system
+            if (local_version >= req.version) {
+                // when x is a equal or newer version than on server, do not start. (also depends on roll back policy)
                 need_download = false;
             }
         }
 
         if (need_download) {
 
-            Log_Debug("Starting download...\n");
+            Log_Debug("Starting download from offset %d...\n", resume_offset);
+
+            // For a refresh download, clean ota.bin file and change local record to {"Downloading":y}
+            if (resume_offset == 0) {
+                lfs_file_truncate(&pOtaContext->lfs, &ota_binary_file, 0);
+                __update_local_record(req.version, false);
+            }
+
+            OtaSetState(otaDownloading, otaErrNone);
 
             sha256_context ctx;
             CURL* curlHandle = NULL;
@@ -240,8 +311,8 @@ static void* ota_thread(void* arg)
             curlHandle = curl_easy_init();
 
             (void)curl_easy_setopt(curlHandle, CURLOPT_CAINFO, Storage_GetAbsolutePathInImagePackage("certs/root.pem"));
-            char* sasurl = calloc(strlen(image_url) + strlen(sas_token) + sizeof('\0'), sizeof(char));
-            (void)strcat(strcat(sasurl, image_url), sas_token);
+            char* sasurl = calloc(strlen(req.p_url) + sizeof('?') + strlen(req.p_sas) + sizeof('\0'), sizeof(char));
+            (void)strcat(strcat(strcat(sasurl, req.p_url), "?"), req.p_sas);
             (void)curl_easy_setopt(curlHandle, CURLOPT_URL, sasurl);
             // specify Azure Blob REST API version, for version order than 2011-08-18 do not accept 'Range: bytes=start-' header
             list = curl_slist_append(list, "x-ms-version:2019-02-02");
@@ -249,7 +320,7 @@ static void* ota_thread(void* arg)
             (void)curl_easy_setopt(curlHandle, CURLOPT_HTTPGET, 1);
             (void)curl_easy_setopt(curlHandle, CURLOPT_RESUME_FROM, resume_offset);
             (void)curl_easy_setopt(curlHandle, CURLOPT_WRITEFUNCTION, write_callback);
-            (void)curl_easy_setopt(curlHandle, CURLOPT_WRITEDATA, &ctx);
+            (void)curl_easy_setopt(curlHandle, CURLOPT_WRITEDATA, &ota_binary_file);
             (void)curl_easy_setopt(curlHandle, CURLOPT_FAILONERROR, 1);
             // abort if speed is below 10bytes/seconds for 30 seconds
             (void)curl_easy_setopt(curlHandle, CURLOPT_LOW_SPEED_TIME,  30);
@@ -259,84 +330,79 @@ static void* ota_thread(void* arg)
             (void)curl_easy_setopt(curlHandle, CURLOPT_NOPROGRESS, 0);
             (void)curl_easy_setopt(curlHandle, CURLOPT_VERBOSE, 1L);
 
-            // Do not change local recoard for resume downloading..
-            if (resume_offset == 0) {
-                __update_local_record(server_version, false);
-            }
-
-            OtaSetState(otaDownloading, otaErrNone);
-
             res = curl_easy_perform(curlHandle);
             if (res == CURLE_OK) {
-
-                position = 0;
-
-                uint8_t hashValue[SHA256_BYTES];
-                char    hashString[SHA256_BYTES * 2 + sizeof('\0')];
-                hashString[SHA256_BYTES * 2] = '\0';
-
-                sha256_done(&ctx, &hashValue[0]);
-                for (uint32_t i = 0; i < SHA256_BYTES; i++) {
-                    sprintf(&hashString[i * 2], "%02X", hashValue[i]);
-                }
-
-                if (strcmp(hashString, image_sha256) == 0) {
-                    Log_Debug("INFO: Image verification Pass!\n");
-
-                    // update local record after sha256 verification
-                    __update_local_record(server_version, true);
-
-                } else {
-                    OtaSetState(otaError, otaErrVerify);
-                    Log_Debug("WARNING: Image verification fail\n");
-                }
+                finish_download = true;
+                Log_Debug("INFO: Download Finished, file size = %d\n", lfs_file_size(&pOtaContext->lfs, &ota_binary_file));
             } else {
-
                 if (res == CURLE_OPERATION_TIMEDOUT) {
                     OtaSetState(otaInterrupted, otaErrTimeout);
                 } else if (res == CURLE_HTTP_RETURNED_ERROR) {
                     OtaSetState(otaInterrupted, otaErrHttp);
-                } 
+                } else if (res == CURLE_WRITE_ERROR) {
+                    OtaSetState(otaError, otaErrIo);
+                }
 
-                Log_Debug("INFO: Download interrupted, %d bytes has transfered\n", position);
+                Log_Debug("INFO: Download interrupted, ret code = %d\n", res);
             }
 
             free(sasurl);
             curl_easy_cleanup(curlHandle);
             curl_global_cleanup();
         } 
+
+        // A completed file is downloaded or has been download (if a powerfail happens after download and before verify pass)
+        if (finish_download) {
+
+            if (__image_verify(&ota_binary_file, req.p_sha256)) {
+                __update_local_record(req.version, true);
+            } else {
+                // empty the file to make sure retry from start 
+                (void)lfs_file_truncate(&pOtaContext->lfs, &ota_binary_file, 0);
+                OtaSetState(otaError, otaErrVerify);
+            }
+        }
            
-        // read again since ota will update local record
+        // read again since a good ota will update local record
         local_version = __get_local_record(&has_partial_image);
         if ((!has_partial_image) && (ExtMCU_GetVersion() < local_version)) {
 
             OtaSetState(otaApplying, otaErrNone);
 
             if (ExtMCU_Download()) {
+                OtaSetVersion(local_version);
                 OtaSetState(otaApplied, otaErrNone);
             } else {
                 OtaSetState(otaError, otaErrMcuDownload);
             }
         }
 
-        free(image_url);
-        free(image_sha256);
+        lfs_file_close(&pOtaContext->lfs, &ota_binary_file);
+        free(req.p_url);
+        free(req.p_sas);
+        free(req.p_sha256);
     }
 }
 
 void OtaHandler(const JSON_Object* extFwInfoProperties)
 {
+    struct ota_request_t req;
+
     if (pOtaContext->is_inited) {
 
-        uint32_t server_version = (uint32_t)json_object_get_number(extFwInfoProperties, "version");
-        char *p_url = json_object_get_string(extFwInfoProperties, "url");
-        char* p_sas = json_object_get_string(extFwInfoProperties, "sas");
-        char *p_sha256 = json_object_get_string(extFwInfoProperties, "sha256");
+        req.version = (uint32_t)json_object_get_number(extFwInfoProperties, "version");
+        req.size = (uint32_t)json_object_get_number(extFwInfoProperties, "size");
+        req.p_url = strdup(json_object_get_string(extFwInfoProperties, "url"));
+        req.p_sas = strdup(json_object_get_string(extFwInfoProperties, "sas"));
+        req.p_sha256 = strdup(json_object_get_string(extFwInfoProperties, "sha256"));
 
-        if ((server_version > 0) && (p_url != NULL) && (p_sas != NULL) && (p_sha256 != NULL)) {
-            
-            //__update_local_record(1, true);
-            __OtaEventEnqueue(server_version, strdup(p_url), strdup(p_sas), strdup(p_sha256));
+        if ((req.version > 0) && (req.size > 0) && (req.p_url != NULL) && (req.p_sas != NULL) && (req.p_sha256 != NULL)) {
+            __OtaEventEnqueue(&req);
+        } else {
+            // free a NULL has no side effect..
+            free(req.p_url);
+            free(req.p_sas);
+            free(req.p_sha256);
         }
     }
 }
@@ -385,6 +451,13 @@ int OtaInit(void)
         goto errExitLabel_5;
     }
 
+    w25q128_init();
+    if (lfs_mount(&pOtaContext->lfs, &g_w25q128_littlefs_config) != LFS_ERR_OK) {
+        Log_Debug("INFO: LFS Mount fail, try to format and re-mount\n");
+        lfs_format(&pOtaContext->lfs, &g_w25q128_littlefs_config);
+        lfs_mount(&pOtaContext->lfs, &g_w25q128_littlefs_config);
+    }
+
     pOtaContext->ota_queue.wpos = 0;
     pOtaContext->ota_queue.rpos = 0;
     pOtaContext->ota_state.status = otaStatusInvalid;
@@ -392,6 +465,7 @@ int OtaInit(void)
     pOtaContext->is_inited = true;
 
     return 0;
+
 errExitLabel_5:
     pthread_mutex_destroy(&pOtaContext->ota_queue.lock);
 errExitLabel_4:
@@ -400,9 +474,9 @@ errExitLabel_3:
     // remove a thread;
 errExitLabel_2:
     close(pOtaContext->local_record_fd);
-    pOtaContext->local_record_fd = -1;
 errExitLabel_1:
     free(pOtaContext);
+    pOtaContext = NULL;
 errExitLabel_0:
     return -1;
 }
@@ -411,7 +485,7 @@ void OtaDeinit() {
     ;
 }
 
-void OtaSetState(enum ota_status_t status, enum ota_error_t error) 
+static void OtaSetState(enum ota_status_t status, enum ota_error_t error) 
 {
     (void)pthread_mutex_lock(&pOtaContext->ota_state.lock);
     pOtaContext->ota_state.status = status;
@@ -425,4 +499,14 @@ void OtaGetState(enum ota_status_t *p_status, enum ota_error_t *p_error)
     *p_status = pOtaContext->ota_state.status;
     *p_error = pOtaContext->ota_state.error;
     (void)pthread_mutex_unlock(&pOtaContext->ota_state.lock);
+}
+
+static void OtaSetVersion(uint32_t version)
+{
+    pOtaContext->ota_version = version;
+}
+
+uint32_t OtaGetVersion(void)
+{
+    return pOtaContext->ota_version;
 }

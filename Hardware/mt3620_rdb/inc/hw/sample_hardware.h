@@ -12,6 +12,12 @@
 #pragma once
 #include "mt3620_rdb.h"
 
+// Connect CS to RDB Header2 Pin4 (GPIO5)
+#define FLASH_CS MT3620_RDB_HEADER2_PIN4_GPIO
+
+// Connect SPI to RDB Header2 Pin1(MISO), Pin3(CLK), Pin7(MOSI), Pin5(CSA) and Pin9(CSB) are not used
+#define FLASH_SPI MT3620_RDB_HEADER2_ISU0_SPI
+
 // MT3620 RDB: Button A
 #define SAMPLE_BUTTON_1 MT3620_RDB_BUTTON_A
 

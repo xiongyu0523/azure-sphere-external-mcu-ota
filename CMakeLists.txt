@@ -4,8 +4,15 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 3.8)
 PROJECT(azure-sphere-external-mcu-ota C)
 
+# global macro
+add_compile_definitions(AzureSphere_CA7)
+
 # Create executable
-ADD_EXECUTABLE(${PROJECT_NAME} main.c epoll_timerfd_utilities.c parson.c ota/ota.c ota/extmcu_hal.c sha256/mark2/sha256.c)
+ADD_EXECUTABLE(${PROJECT_NAME} main.c epoll_timerfd_utilities.c parson.c delay.c 
+               ota/ota.c ota/extmcu_hal.c sha256/mark2/sha256.c  
+               littlefs/lfs.c littlefs/lfs_util.c
+               spiflash_driver/src/spiflash.c
+               littlefs_w25q128.c)
 TARGET_INCLUDE_DIRECTORIES(${PROJECT_NAME} PUBLIC ${AZURE_SPHERE_API_SET_DIR}/usr/include/azureiot)
 TARGET_COMPILE_DEFINITIONS(${PROJECT_NAME} PUBLIC AZURE_IOT_HUB_CONFIGURED)
 TARGET_LINK_LIBRARIES(${PROJECT_NAME} m azureiot applibs pthread gcc_s c curl)

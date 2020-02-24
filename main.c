@@ -177,9 +177,9 @@ static void ButtonPollTimerEventHandler(EventData *eventData)
     SendOrientationButtonHandler();
 }
 
-static void __report_ota_state_dev_twin(enum ota_status_t status, enum ota_error_t error)
+static void __otaInfoReport(void)
 {
-    const char *cOtaStatusString[] = {
+    const char* cOtaStatusString[] = {
         "downloading",
         "interrupted",
         "applying",
@@ -188,21 +188,43 @@ static void __report_ota_state_dev_twin(enum ota_status_t status, enum ota_error
         "invalid"
     };
 
-    const char *cOtaErrorString[] = {
+    const char* cOtaErrorString[] = {
         "SHA256 verify fail",
         "Http Response > 400",
         "Network Timeout",
         "MCU Download fail",
+        "File operation fail",
         "None"
     };
 
-    static char buffer[100] = { 0 };
-    (void)snprintf(buffer, 100, "{\"extFwInfo\":{\"Status\":\"%s\",\"Error\":\"%s\"}}", cOtaStatusString[status], cOtaErrorString[error]);
+    char buffer[100] = { 0 };
+    static enum ota_status_t s_lastOtaState = otaStatusInvalid;
+    enum ota_status_t ota_status;
+    enum ota_error_t ota_error;
+    uint32_t applied_version;
 
-    Log_Debug("str=%s\n", buffer);
+    // async report state to Azure IoT
+    OtaGetState(&ota_status, &ota_error);
+    if (ota_status != s_lastOtaState) {
+        s_lastOtaState = ota_status;
 
-    if (IoTHubDeviceClient_LL_SendReportedState(iothubClientHandle, buffer, strlen(buffer), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
-        Log_Debug("ERROR: IoTHubDeviceClient_LL_SendReportedState call fail\n");
+        (void)snprintf(buffer, 100, "{\"extFwInfo\":{\"Status\":\"%s\",\"Error\":\"%s\"}}", cOtaStatusString[ota_status], cOtaErrorString[ota_error]);
+        if (IoTHubDeviceClient_LL_SendReportedState(iothubClientHandle, buffer, strlen(buffer), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
+            Log_Debug("ERROR: IoTHubDeviceClient_LL_SendReportedState call fail\n");
+        }
+
+        if (ota_status == otaApplied) {
+            applied_version = OtaGetVersion();
+
+            (void)snprintf(buffer, 100, "{\"extFwInfo\":{\"Version\": %d}}", applied_version);
+            if (IoTHubDeviceClient_LL_SendReportedState(iothubClientHandle, buffer, strlen(buffer), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
+                Log_Debug("ERROR: IoTHubDeviceClient_LL_SendReportedState call fail\n");
+            }
+        }
+
+        if ((ota_status == otaInterrupted) && (ota_error == otaErrTimeout)) {
+            iothubConnected = false;
+        }
     }
 }
 
@@ -235,26 +257,12 @@ static void AzureTimerEventHandler(EventData *eventData)
 /// </summary>
 static void AzureDoWorkEventHandler(EventData* eventData)
 {
-    static enum ota_status_t s_lastOtaState = otaStatusInvalid;
-    enum ota_status_t ota_status;
-    enum ota_error_t ota_error;
-
     if (ConsumeTimerFdEvent(azureDoWorkFd) != 0) {
         terminationRequired = true;
         return;
     }
 
-    // async report state to Azure IoT
-    OtaGetState(&ota_status, &ota_error);
-    if (ota_status != s_lastOtaState) {
-        s_lastOtaState = ota_status;
-
-        __report_ota_state_dev_twin(ota_status, ota_error);
-
-        if ((ota_status == otaInterrupted) && (ota_error == otaErrTimeout)) {
-            iothubConnected = false;
-        }
-    }
+    __otaInfoReport();
 
     IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
 }
