@@ -10,7 +10,7 @@ void ExtMCU_Init(void)
 
 uint32_t ExtMCU_GetVersion()
 {
-    
+    return 0;
 }
 
 bool ExtMCU_Download()
