@@ -21,11 +21,12 @@ This reference design include
 ### Prerequisite
 
 1. Visual Studio 2019
-2. Azure Sphere SDK [20.01](https://aka.ms/AzureSphereSDKDownload) for Visual Studio
+2. Azure Sphere SDK 20.01 for Visual Studio
 3. Python 3.x
 4. Git
 5. Azure CLI with Azure IoT Hub extension
-6. [Azure IoT SDK for Python V2](https://github.com/Azure/azure-iot-sdk-python)
+6. Azure IoT SDK for Python V2
+7. Azure subscription 
 
 ### Prep your device and environment
 
