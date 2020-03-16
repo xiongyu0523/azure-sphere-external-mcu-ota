@@ -124,8 +124,9 @@ This project has submoduled several open sources project on github, please refer
 - [SHA256](https://github.com/ilvn/SHA256)
 - [azure-sphere-samples](https://github.com/Azure/azure-sphere-samples)
 
-All other code developed are 
+All other code developed within project are MIT license
 
+```
 MIT License
 
 Copyright (c) 2020 neo
@@ -147,3 +148,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
